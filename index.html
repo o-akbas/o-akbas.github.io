@@ -1,0 +1,1740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="theme-color" content="#4f46e5" />
+  <!-- Add-to-Home-Screen (iPad/iOS + Android Chrome): launch full-screen, app-like. -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Assessments" />
+  <title>Skills Assessment Console</title>
+
+  <!-- Tailwind CSS (Play CDN). Its MutationObserver generates styles for classes we inject at runtime. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js (radar charts). UMD build exposes the global `Chart`. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    /* Small ergonomics the utility classes don't cover. */
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+    textarea { resize: vertical; }
+    /* Calmer touch: no grey tap flash on iOS. */
+    * { -webkit-tap-highlight-color: transparent; }
+    /* On touch devices keep focusable fields >=16px so iOS Safari doesn't zoom-on-focus. */
+    @media (pointer: coarse) {
+      input:not([type=checkbox]):not([type=radio]), textarea, select { font-size: 16px !important; }
+    }
+    /* Hide the number-input spinners for a cleaner score field. */
+    input[type=number]::-webkit-outer-spin-button,
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+
+    /* ----- Print optimisation: native Print -> clean PDF of the Profile report only. ----- */
+    @media print {
+      .no-print { display: none !important; }          /* nav, panels, buttons */
+      body { background: #fff !important; }
+      #view-root { padding: 0 !important; }
+      .print-card { box-shadow: none !important; border: 1px solid #e2e8f0 !important; }
+      .print-break-avoid { break-inside: avoid; page-break-inside: avoid; }
+      @page { margin: 14mm; }
+    }
+  </style>
+</head>
+
+<body class="bg-slate-100 text-slate-800 font-sans antialiased">
+  <!-- Stable shell. JS only ever rewrites the innerHTML of these regions; listeners live on the
+       stable containers (event delegation), so they never need re-attaching. -->
+  <header id="data-panel" class="no-print"></header>
+  <main id="view-root" class="max-w-7xl mx-auto px-4 sm:px-6 py-6"></main>
+  <div id="modal-root"></div>
+  <div id="toast-root" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 items-end no-print"></div>
+
+  <script>
+  "use strict";
+  /* =====================================================================================
+   * Skills Assessment Console — single-file, framework-free.
+   * Architecture: one in-memory `state` object is the single source of truth; `render()`
+   * rebuilds the active view from it. Isolated helpers: Scoring (pure math/validation),
+   * Storage (File System Access API + graceful fallback), Charts (Chart.js radar).
+   * State is file-driven only — no application data is kept in localStorage/IndexedDB
+   * (IndexedDB holds *file handles* only, so files don't need re-picking).
+   * ===================================================================================== */
+
+  /* ------------------------------------------------------------------ 1. Constants */
+
+  // A category whose name contains one of these (case-insensitive) is treated as a
+  // "soft skill" axis for the Senior role-target overlay. Edit freely.
+  const SOFT_SKILL_KEYWORDS = ['soft'];
+
+  // Role expectation baselines, split into technical vs soft-skill axes.
+  const ROLE_TARGETS = {
+    junior:   { technical: 3, soft: 3 },
+    mid:      { technical: 5, soft: 5 },
+    senior:   { technical: 8, soft: 6 },
+    techlead: { technical: 8, soft: 8 },
+  };
+
+  // Difficulty weighting: a question's score counts toward its category in proportion to its level.
+  // Acing only easy questions can't fill an axis; hard-level mastery is needed to reach the top.
+  // Edit freely to retune. Keys are the primary level digit ("Level 4-5 (Alt)" -> "4").
+  const LEVEL_DIFFICULTY = { '1': 0.50, '2': 0.65, '3': 0.80, '4': 0.90, '5': 1.00 };
+  const CUSTOM_DIFFICULTY = 1.00;   // interviewer-written (custom) questions count at full weight
+
+  const FAVORITES_FILENAME = 'favorites.json';
+
+  // Dropdown options for a new session. `value` is what we store; it maps cleanly via mapPosition().
+  const POSITIONS = [
+    { value: 'Junior',     label: 'Junior' },
+    { value: 'Mid-Level',  label: 'Mid-Level' },
+    { value: 'Senior',     label: 'Senior' },
+    { value: 'Tech Lead',  label: 'Tech Lead' },
+  ];
+
+  const SESSIONS_FILENAME = 'sessions.json';
+
+  // On-device persistence keys (localStorage). Lets the app work without a connected file —
+  // essential on iPad/Safari, where the File System Access API is unavailable.
+  const LS_BANK = 'assessment-bank';
+  const LS_SESSIONS = 'assessment-sessions';
+
+  // Chart colours.
+  const COLOR = {
+    a:      { border: 'rgba(79,70,229,1)',    fill: 'rgba(79,70,229,0.20)' },  // indigo  (candidate / session A)
+    b:      { border: 'rgba(16,185,129,1)',   fill: 'rgba(16,185,129,0.20)' }, // emerald (session B)
+    target: { border: 'rgba(100,116,139,0.9)',fill: 'rgba(100,116,139,0.08)' },// slate   (role target overlay)
+  };
+
+  // Series colours for the multi-session Compare radar (cycled when sessions outnumber entries).
+  const PALETTE = [
+    COLOR.a,
+    COLOR.b,
+    { border: 'rgba(245,158,11,1)', fill: 'rgba(245,158,11,0.15)' },  // amber
+    { border: 'rgba(244,63,94,1)',  fill: 'rgba(244,63,94,0.15)' },   // rose
+    { border: 'rgba(14,165,233,1)', fill: 'rgba(14,165,233,0.15)' },  // sky
+    { border: 'rgba(168,85,247,1)', fill: 'rgba(168,85,247,0.15)' },  // purple
+    { border: 'rgba(20,184,166,1)', fill: 'rgba(20,184,166,0.15)' },  // teal
+    { border: 'rgba(234,88,12,1)',  fill: 'rgba(234,88,12,0.15)' },   // orange
+  ];
+
+  /* ------------------------------------------------------------------ 2. State */
+
+  const state = {
+    view: 'dashboard',                 // 'dashboard' | 'evaluation' | 'profile' | 'analytics' | 'compare'
+
+    bank: null,                        // { categories: { [name]: Question[] } }
+    sessions: [],                      // loaded history + newly finished (source of truth for export)
+
+    storage: {
+      mode: 'fallback',                // 'fsapi' | 'fallback'
+      questionsHandle: null,
+      sessionsHandle: null,
+      questionsName: '',               // display name of the connected/loaded questions file
+      sessionsName: '',
+      needsReconnect: false,           // cached handles exist but permission not yet granted this load
+      saveState: 'idle',               // 'idle' | 'saving' | 'saved' | 'error'
+      dirty: false,                    // unsaved changes (drives the Export reminder in fallback mode)
+      favoritesHandle: null,
+      favoritesName: '',               // display name of the connected favorites file
+    },
+
+    dashboard: { search: '' },
+    compare: { selected: [], search: '' },   // dedicated Compare view: chosen session ids + list filter
+
+    active: null,                      // in-progress evaluation draft (see startSession)
+    profile: { sessionId: null },
+    ui: { modal: null },               // 'new-session' | null
+  };
+
+  /* ------------------------------------------------------------------ 3. Utilities */
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+
+  /** Escape text destined for innerHTML / attribute values. */
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  /** Round to 2 decimals, returning a Number (e.g. 4.666 -> 4.67, 8 -> 8). */
+  const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
+  function uuid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  }
+
+  const todayISO = () => new Date().toISOString().slice(0, 10);
+
+  /** Ordered list of category names from the loaded bank (stable insertion order). */
+  const bankCats = () => (state.bank ? Object.keys(state.bank.categories) : []);
+
+  /** Transient toast notification. */
+  function showToast(message, type = 'info') {
+    const tone = {
+      info:    'bg-slate-800',
+      success: 'bg-emerald-600',
+      warn:    'bg-amber-600',
+      error:   'bg-red-600',
+    }[type] || 'bg-slate-800';
+    const node = document.createElement('div');
+    node.className = `${tone} text-white text-sm px-4 py-2.5 rounded-lg shadow-lg max-w-sm`;
+    node.textContent = message;
+    $('#toast-root').appendChild(node);
+    setTimeout(() => { node.style.transition = 'opacity .4s'; node.style.opacity = '0'; }, 4200);
+    setTimeout(() => node.remove(), 4700);
+  }
+
+  /* ------------------------------------------------------------------ 4. Scoring (pure) */
+
+  /** Keep only valid integer scores in [1,10]. */
+  function validNumbers(arr) {
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(n => typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 10);
+  }
+
+  /** Arithmetic mean of valid scores, rounded to 2 decimals; null when there are none. */
+  function computeAverage(scores) {
+    const valid = validNumbers(scores);
+    if (!valid.length) return null;
+    return round2(valid.reduce((a, b) => a + b, 0) / valid.length);
+  }
+
+  /** Map a scores object to an averages object, omitting empty categories. */
+  function computeAverages(scoresMap) {
+    const out = {};
+    Object.keys(scoresMap || {}).forEach(cat => {
+      const avg = computeAverage(scoresMap[cat]);
+      if (avg !== null) out[cat] = avg;
+    });
+    return out;
+  }
+
+  /** Difficulty factor for a response's level (custom / unknown -> CUSTOM_DIFFICULTY). */
+  function levelFactor(level, custom) {
+    if (custom) return CUSTOM_DIFFICULTY;
+    const f = LEVEL_DIFFICULTY[levelKey(level)];
+    return f == null ? CUSTOM_DIFFICULTY : f;
+  }
+
+  /** Difficulty-weighted mean of (score x factor) over scored responses; null when none. */
+  function computeWeightedAverage(responses) {
+    const scored = scoredResponses(responses);
+    if (!scored.length) return null;
+    const sum = scored.reduce((a, r) => a + r.score * levelFactor(r.level, r.custom), 0);
+    return round2(sum / scored.length);
+  }
+
+  /** Map a { category: [responses] } map to weighted averages, omitting empty categories. */
+  function computeWeightedAverages(responsesMap) {
+    const out = {};
+    Object.keys(responsesMap || {}).forEach(cat => {
+      const avg = computeWeightedAverage(responsesMap[cat]);
+      if (avg !== null) out[cat] = avg;
+    });
+    return out;
+  }
+
+  /** Every bank category needs >= 3 scored questions to finish. */
+  function validateSession(active, bank) {
+    const missing = [];
+    Object.keys(bank.categories).forEach(cat => {
+      if (scoredResponses(active.responses[cat]).length < 3) missing.push(cat);
+    });
+    return { ok: missing.length === 0, missing };
+  }
+
+  /** Is this a valid integer score in [1,10]? */
+  function isValidScore(n) { return typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 10; }
+
+  /** Per-question response objects that carry a valid score. */
+  function scoredResponses(arr) { return (Array.isArray(arr) ? arr : []).filter(r => r && isValidScore(r.score)); }
+
+  /** Derive a { category: [scores] } map from a { category: [responses] } map. */
+  function responsesToScores(responsesMap) {
+    const out = {};
+    Object.keys(responsesMap || {}).forEach(cat => { out[cat] = scoredResponses(responsesMap[cat]).map(r => r.score); });
+    return out;
+  }
+
+  /** Cross-session per-question aggregation: count, average, and best performer per (category, question). */
+  function aggregateQuestions(sessions) {
+    const map = new Map();
+    (sessions || []).forEach(s => {
+      if (!s.responses) return;                       // only sessions saved with per-question detail
+      Object.keys(s.responses).forEach(cat => {
+        scoredResponses(s.responses[cat]).forEach(r => {
+          const key = cat + '\u0000' + (r.question || '');
+          if (!map.has(key)) map.set(key, { category: cat, question: r.question || '(custom question)', entries: [] });
+          map.get(key).entries.push({ engineer: s.engineerName, date: s.date, score: r.score });
+        });
+      });
+    });
+    return [...map.values()].map(q => {
+      const total = q.entries.reduce((a, e) => a + e.score, 0);
+      const best = q.entries.reduce((m, e) => (e.score > m.score ? e : m), q.entries[0]);
+      return { category: q.category, question: q.question, count: q.entries.length, avg: round2(total / q.entries.length), best };
+    });
+  }
+
+  /** Highest-scoring session (engineer + date) per category, by average. */
+  function categoryLeaders(sessions) {
+    const byCat = {};
+    (sessions || []).forEach(s => {
+      const avgs = sessionAverages(s);
+      Object.keys(avgs).forEach(cat => {
+        if (!byCat[cat] || avgs[cat] > byCat[cat].avg) byCat[cat] = { engineer: s.engineerName, date: s.date, avg: avgs[cat] };
+      });
+    });
+    return byCat;
+  }
+
+  /** Classify a radar axis by category name. */
+  function classifyAxis(categoryName) {
+    const lower = String(categoryName).toLowerCase();
+    return SOFT_SKILL_KEYWORDS.some(k => lower.includes(k)) ? 'soft' : 'technical';
+  }
+
+  /** Tolerant position mapping (handles the dropdown values and legacy free-form strings). */
+  function mapPosition(raw) {
+    const p = String(raw || '').toLowerCase();
+    if (!p) return null;
+    if (p.includes('tech lead') || p.includes('lead')) return 'techlead';
+    if (p.includes('senior')) return 'senior';
+    if (p.includes('mid')) return 'mid';
+    if (p.includes('junior')) return 'junior';
+    return null;
+  }
+
+  /** Role-target value for each axis, or null when the position can't be mapped. */
+  function resolveRoleTargets(position, categories) {
+    const role = mapPosition(position);
+    if (!role) return null;
+    const targets = {};
+    categories.forEach(cat => { targets[cat] = ROLE_TARGETS[role][classifyAxis(cat)]; });
+    return targets;
+  }
+
+  /** Axes present on a session (prefer averages keys, fall back to scores keys). */
+  function sessionAxes(session) {
+    const fromAvg = Object.keys(session.averages || {});
+    return fromAvg.length ? fromAvg : Object.keys(session.scores || {});
+  }
+
+  /** Ordered union of the axes across any number of sessions. */
+  function unionAxesMulti(sessions) {
+    const seen = new Set();
+    const out = [];
+    (sessions || []).forEach(s => sessionAxes(s).forEach(c => { if (!seen.has(c)) { seen.add(c); out.push(c); } }));
+    return out;
+  }
+
+  /** Ordered union of the axes of two sessions. */
+  function unionAxes(a, b) { return unionAxesMulti([a, b]); }
+
+  /** Weighted average for a category on a session: prefer per-question detail (re-scores legacy
+   *  sessions consistently under the difficulty model), else stored averages, else legacy flat mean. */
+  function avgOf(session, cat) {
+    if (session.responses && session.responses[cat]) {
+      const w = computeWeightedAverage(session.responses[cat]);
+      if (w !== null) return w;
+    }
+    if (session.averages && session.averages[cat] != null) return session.averages[cat];
+    return computeAverage(session.scores ? session.scores[cat] : null);
+  }
+
+  /** Per-session { category: weightedAvg } map, with the same precedence as avgOf(). */
+  function sessionAverages(session) {
+    if (session.responses && Object.keys(session.responses).length) {
+      const w = computeWeightedAverages(session.responses);
+      if (Object.keys(w).length) return w;
+    }
+    if (session.averages && Object.keys(session.averages).length) return session.averages;
+    return computeAverages(session.scores || {});
+  }
+
+  /* ------------------------------------------------------------------ 5. Storage layer */
+
+  // Minimal IndexedDB key/value store — used ONLY to persist FileSystemFileHandle objects so the
+  // user need not re-pick files. No assessment data is ever written here.
+  const idb = {
+    _db: null,
+    open() {
+      if (this._db) return Promise.resolve(this._db);
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open('assessment-handles', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('handles');
+        req.onsuccess = () => { this._db = req.result; resolve(this._db); };
+        req.onerror = () => reject(req.error);
+      });
+    },
+    async _tx(mode, fn) {
+      const db = await this.open();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('handles', mode);
+        const store = tx.objectStore('handles');
+        const req = fn(store);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    },
+    get(key)      { return this._tx('readonly',  s => s.get(key)); },
+    set(key, val) { return this._tx('readwrite', s => s.put(val, key)); },
+  };
+
+  // Tiny localStorage wrapper (JSON in/out, never throws — Safari private mode can deny access).
+  const LS = {
+    get(key) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } },
+    set(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); return true; } catch { return false; } },
+  };
+
+  const Storage = {
+    supportsFSAPI: typeof window.showOpenFilePicker === 'function',
+
+    /** Decide mode and, in FS mode, see whether cached handles can be silently restored. */
+    async init() {
+      if (!this.supportsFSAPI) { state.storage.mode = 'fallback'; return; }
+      state.storage.mode = 'fsapi';
+      try {
+        const qh = await idb.get('questionsHandle');
+        const sh = await idb.get('sessionsHandle');
+        let restoredAny = false;
+
+        // queryPermission needs no user gesture; only auto-load when already granted.
+        if (qh && (await qh.queryPermission({ mode: 'read' })) === 'granted') {
+          await this._loadQuestionsFromHandle(qh); restoredAny = true;
+        } else if (qh) { state.storage.questionsHandle = qh; state.storage.needsReconnect = true; }
+
+        if (sh && (await sh.queryPermission({ mode: 'readwrite' })) === 'granted') {
+          await this._loadSessionsFromHandle(sh); restoredAny = true;
+        } else if (sh) { state.storage.sessionsHandle = sh; state.storage.needsReconnect = true; }
+
+        const fh = await idb.get('favoritesHandle');
+        if (fh && (await fh.queryPermission({ mode: 'readwrite' })) === 'granted') {
+          await this._loadFavoritesFromHandle(fh); restoredAny = true;
+        } else if (fh) { state.storage.favoritesHandle = fh; state.storage.needsReconnect = true; }
+
+        if (restoredAny) showToast('Restored your connected data files.', 'success');
+      } catch (err) {
+        console.warn('Handle restore failed:', err);
+      }
+    },
+
+    /** User-gesture re-grant for cached handles (the single click after a page reload). */
+    async reconnect() {
+      try {
+        if (state.storage.questionsHandle &&
+            (await state.storage.questionsHandle.requestPermission({ mode: 'read' })) === 'granted') {
+          await this._loadQuestionsFromHandle(state.storage.questionsHandle);
+        }
+        if (state.storage.sessionsHandle &&
+            (await state.storage.sessionsHandle.requestPermission({ mode: 'readwrite' })) === 'granted') {
+          await this._loadSessionsFromHandle(state.storage.sessionsHandle);
+        }
+        if (state.storage.favoritesHandle &&
+            (await state.storage.favoritesHandle.requestPermission({ mode: 'readwrite' })) === 'granted') {
+          await this._loadFavoritesFromHandle(state.storage.favoritesHandle);
+        }
+        state.storage.needsReconnect = false;
+        render();
+      } catch (err) {
+        showToast('Could not restore file access.', 'error');
+      }
+    },
+
+    async connectQuestions() {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        await this._loadQuestionsFromHandle(handle);
+        await idb.set('questionsHandle', handle);
+        render();
+      } catch (err) { if (err.name !== 'AbortError') showToast('Failed to open questions file.', 'error'); }
+    },
+
+    async openSessions() {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        await this._loadSessionsFromHandle(handle);
+        await idb.set('sessionsHandle', handle);
+        render();
+      } catch (err) { if (err.name !== 'AbortError') showToast('Failed to open history file.', 'error'); }
+    },
+
+    async createSessions() {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: SESSIONS_FILENAME,
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        state.storage.sessionsHandle = handle;
+        state.storage.sessionsName = handle.name;
+        await idb.set('sessionsHandle', handle);
+        await this.saveSessions();           // initialise the file with the current (possibly empty) array
+        showToast('Created ' + handle.name + '. Auto-save is on.', 'success');
+        render();
+      } catch (err) { if (err.name !== 'AbortError') showToast('Failed to create history file.', 'error'); }
+    },
+
+    async _loadQuestionsFromHandle(handle) {
+      const file = await handle.getFile();
+      ingestQuestions(await file.text(), file.name);
+      state.storage.questionsHandle = handle;
+    },
+
+    async _loadSessionsFromHandle(handle) {
+      const file = await handle.getFile();
+      ingestSessions(await file.text(), file.name);
+      state.storage.sessionsHandle = handle;
+    },
+
+    async connectFavorites() {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        await this._loadFavoritesFromHandle(handle);
+        await idb.set('favoritesHandle', handle);
+        render();
+      } catch (err) { if (err.name !== 'AbortError') showToast('Failed to open favorites file.', 'error'); }
+    },
+
+    async createFavorites() {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: FAVORITES_FILENAME,
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        state.storage.favoritesHandle = handle;
+        state.storage.favoritesName = handle.name;
+        await idb.set('favoritesHandle', handle);
+        await this.saveFavorites();          // seed the new file with current (localStorage) favorites
+        showToast('Created ' + handle.name + '. Auto-save is on.', 'success');
+        render();
+      } catch (err) { if (err.name !== 'AbortError') showToast('Failed to create favorites file.', 'error'); }
+    },
+
+    async _loadFavoritesFromHandle(handle) {
+      const file = await handle.getFile();
+      ingestFavorites(await file.text(), file.name);
+      state.storage.favoritesHandle = handle;
+    },
+
+    /** Persist favorites. FS mode with a connected file -> write in place; otherwise localStorage
+     *  already holds them (Favorites._persistLocal) and fallback users use Export. */
+    async saveFavorites() {
+      if (state.storage.mode === 'fsapi' && state.storage.favoritesHandle) {
+        try {
+          const writable = await state.storage.favoritesHandle.createWritable();
+          await writable.write(JSON.stringify(Favorites.list(), null, 2));
+          await writable.close();
+        } catch (err) {
+          showToast('Could not auto-save favorites — use Export.', 'error');
+        }
+      }
+    },
+
+    /** Always-available "download a copy" of the favorites list. */
+    exportFavorites() {
+      const blob = new Blob([JSON.stringify(Favorites.list(), null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = FAVORITES_FILENAME;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      showToast('Exported ' + FAVORITES_FILENAME, 'success');
+    },
+
+    /** Persist the full sessions array. Always cache on-device (localStorage) so data survives a
+     *  reload even on iPad/Safari; additionally write the connected file in FS mode. */
+    async saveSessions() {
+      const cached = LS.set(LS_SESSIONS, state.sessions);
+      if (state.storage.mode === 'fsapi' && state.storage.sessionsHandle) {
+        try {
+          state.storage.saveState = 'saving'; renderDataPanel();
+          const writable = await state.storage.sessionsHandle.createWritable();
+          await writable.write(JSON.stringify(state.sessions, null, 2));
+          await writable.close();
+          state.storage.saveState = 'saved';
+          state.storage.dirty = false;
+          renderDataPanel();
+        } catch (err) {
+          state.storage.saveState = 'error';
+          renderDataPanel();
+          showToast('File auto-save failed — your data is still saved on this device. Use Export for a file copy.', 'error');
+        }
+      } else {
+        // No connected file (e.g. iPad): data lives in on-device storage; Export makes a portable copy.
+        state.storage.dirty = true;
+        renderDataPanel();
+        if (!cached) showToast('On-device storage is full — Export a backup to avoid losing data.', 'warn');
+      }
+    },
+
+    /** Always-available "download a copy" of the full merged history. */
+    exportSessions() {
+      const blob = new Blob([JSON.stringify(state.sessions, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = SESSIONS_FILENAME;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      state.storage.dirty = false;
+      renderDataPanel();
+      showToast('Exported ' + SESSIONS_FILENAME, 'success');
+    },
+  };
+
+  /* ---- Favorites: a per-interviewer set of starred bank questions ----
+   * Live in-memory Set, cached to localStorage for instant offline persistence, and (when a
+   * favorites file is connected) auto-saved to favorites.json via the Storage layer. Keyed by the
+   * same NUL-separated (category, question) composite as aggregateQuestions(). */
+  const Favorites = {
+    _lsKey: 'assessment-favorites',
+    set: new Set(),
+    key(cat, q) { return String(cat) + ' ' + String(q == null ? '' : q); },
+    has(cat, q) { return this.set.has(this.key(cat, q)); },
+    list() { return [...this.set]; },
+    loadLocal() {
+      try { this.set = new Set(JSON.parse(localStorage.getItem(this._lsKey) || '[]')); }
+      catch { this.set = new Set(); }
+    },
+    _persistLocal() {
+      try { localStorage.setItem(this._lsKey, JSON.stringify(this.list())); } catch {}
+    },
+    replaceFrom(arr) { this.set = new Set(Array.isArray(arr) ? arr : []); this._persistLocal(); },
+    toggle(cat, q) {
+      const k = this.key(cat, q);
+      if (this.set.has(k)) this.set.delete(k); else this.set.add(k);
+      this._persistLocal();
+      Storage.saveFavorites();          // writes favorites.json when a file is connected
+    },
+  };
+
+  /** Parse + validate a favorites file (a JSON array of composite keys) and load it. */
+  function ingestFavorites(text, name) {
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch { showToast('Could not read ' + name + ': invalid JSON.', 'error'); return; }
+    if (!Array.isArray(parsed)) { showToast('Favorites must be a JSON array.', 'error'); return; }
+    Favorites.replaceFrom(parsed);
+    state.storage.favoritesName = name || FAVORITES_FILENAME;
+    showToast('Loaded ' + parsed.length + ' favorite(s).', 'success');
+  }
+
+  /** Parse + validate a questions file and load it into state. Throws nothing — alerts on failure. */
+  function ingestQuestions(text, name) {
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch { showToast('Could not read ' + name + ': invalid JSON.', 'error'); return; }
+    if (!parsed || typeof parsed !== 'object' || !parsed.categories ||
+        typeof parsed.categories !== 'object' || !Object.keys(parsed.categories).length) {
+      showToast('That file has no "categories" — not a question bank.', 'error'); return;
+    }
+    state.bank = parsed;
+    state.storage.questionsName = name || 'questions.json';
+    LS.set(LS_BANK, parsed);                       // cache the bank so iPad needn't re-import each visit
+    showToast('Loaded ' + Object.keys(parsed.categories).length + ' categories.', 'success');
+  }
+
+  /** Parse + validate a sessions file and load it into state (empty array allowed). */
+  function ingestSessions(text, name) {
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch { showToast('Could not read ' + name + ': invalid JSON.', 'error'); return; }
+    if (!Array.isArray(parsed)) { showToast('Session history must be a JSON array.', 'error'); return; }
+    state.sessions = parsed;
+    state.storage.sessionsName = name || SESSIONS_FILENAME;
+    LS.set(LS_SESSIONS, state.sessions);          // mirror the import to on-device storage
+    showToast('Loaded ' + parsed.length + ' session(s).', 'success');
+  }
+
+  /* ------------------------------------------------------------------ 6. Charts */
+
+  const Charts = {
+    compare: null,
+    profile: null,
+
+    destroyAll() {
+      if (this.compare) { this.compare.destroy(); this.compare = null; }
+      if (this.profile) { this.profile.destroy(); this.profile = null; }
+    },
+
+    _baseOptions() {
+      return {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,                         // crisp + print-friendly + deterministic
+        scales: {
+          r: {
+            min: 0, max: 10,
+            ticks: { stepSize: 2, backdropColor: 'transparent', color: '#64748b' },
+            grid: { color: '#e2e8f0' },
+            angleLines: { color: '#e2e8f0' },
+            pointLabels: { font: { size: 12 }, color: '#334155' },
+          },
+        },
+        plugins: { legend: { position: 'top', labels: { usePointStyle: true } } },
+      };
+    },
+
+    _dataset(label, axes, valuesFor, color, dashed = false) {
+      return {
+        label,
+        data: axes.map(valuesFor),
+        borderColor: color.border,
+        backgroundColor: color.fill,
+        borderWidth: 2,
+        borderDash: dashed ? [6, 6] : [],
+        pointRadius: dashed ? 0 : 3,
+        pointBackgroundColor: color.border,
+        spanGaps: false,                          // a missing axis shows as a gap, not a guess
+      };
+    },
+
+    renderCompareMulti(canvas, sessions) {
+      this.destroyAll();
+      const axes = unionAxesMulti(sessions);
+      this.compare = new Chart(canvas, {
+        type: 'radar',
+        data: {
+          labels: axes,
+          datasets: sessions.map((s, i) => this._dataset(
+            `${s.engineerName || 'Candidate'} · ${s.date}`, axes,
+            c => avgOf(s, c) ?? 0,          // a category this session never covered plots as 0 (closes the polygon)
+            PALETTE[i % PALETTE.length])),
+        },
+        options: this._baseOptions(),
+      });
+    },
+
+    renderProfile(canvas, s) {
+      this.destroyAll();
+      const axes = sessionAxes(s);
+      const datasets = [this._dataset(s.engineerName || 'Candidate', axes, c => avgOf(s, c), COLOR.a)];
+      const targets = resolveRoleTargets(s.position, axes);
+      if (targets) {
+        datasets.push(this._dataset(`Target · ${s.position}`, axes, c => targets[c], COLOR.target, true));
+      }
+      this.profile = new Chart(canvas, {
+        type: 'radar',
+        data: { labels: axes, datasets },
+        options: this._baseOptions(),
+      });
+    },
+  };
+
+  /* ------------------------------------------------------------------ 7. Rendering */
+
+  /** Top-level dispatcher. Charts are destroyed first to avoid canvas-reuse errors. */
+  function render() {
+    Charts.destroyAll();
+    renderDataPanel();
+    renderModal();
+    const root = $('#view-root');
+    if (state.view === 'evaluation' && state.active) root.innerHTML = viewEvaluation();
+    else if (state.view === 'profile' && state.profile.sessionId) { root.innerHTML = viewProfile(); afterProfile(); }
+    else if (state.view === 'analytics') root.innerHTML = viewAnalytics();
+    else if (state.view === 'compare') { root.innerHTML = viewCompare(); afterCompare(); }
+    else { state.view = 'dashboard'; root.innerHTML = viewDashboard(); afterDashboard(); }
+  }
+
+  /* ---- Data Management panel (always visible) ---- */
+
+  function renderDataPanel() {
+    const s = state.storage;
+    const bankLoaded = !!state.bank;
+
+    const status = (ok, name, fallbackText) => ok
+      ? `<span class="inline-flex items-center gap-1 text-emerald-700"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg>${esc(name)}</span>`
+      : `<span class="text-slate-400">${esc(fallbackText)}</span>`;
+
+    const favLoaded = !!s.favoritesName;
+
+    // Status chips: a connected file shows its name; otherwise reflect on-device (localStorage) data.
+    const bankStatus = s.questionsName ? status(true, s.questionsName, '')
+      : state.bank ? status(true, 'saved on this device', '') : status(false, '', 'not loaded');
+    const sessStatus = s.sessionsName ? status(true, s.sessionsName, '')
+      : state.sessions.length ? status(true, state.sessions.length + ' saved on this device', '') : status(false, '', 'none — starts empty');
+
+    // Mode-specific controls.
+    let questionsControls, sessionsControls, favoritesControls;
+    if (s.mode === 'fsapi') {
+      questionsControls = btn('connect-questions', bankLoaded ? 'Change…' : 'Open Questions Bank', 'secondary');
+      sessionsControls =
+        btn('open-sessions', 'Open History', 'secondary') +
+        btn('create-sessions', 'Create New', 'secondary');
+      favoritesControls =
+        btn('open-favorites', favLoaded ? 'Change…' : 'Open Favorites', 'secondary') +
+        btn('create-favorites', 'Create New', 'secondary') +
+        btn('export-favorites', 'Export', 'secondary');
+    } else {
+      questionsControls = fileInput('file-questions', 'Choose questions.json');
+      sessionsControls = fileInput('file-sessions', 'Choose sessions.json');
+      favoritesControls = fileInput('file-favorites', 'Choose favorites.json') + btn('export-favorites', 'Export', 'secondary');
+    }
+
+    const reconnectBanner = s.needsReconnect
+      ? `<div class="mb-3 flex items-center justify-between gap-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
+           <span>Previously connected files found. One click restores access.</span>
+           ${btn('reconnect-files', 'Reconnect files', 'amber')}
+         </div>` : '';
+
+    const dirtyBanner = (s.mode === 'fallback' && s.dirty)
+      ? `<div class="mt-3 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-sm text-slate-600">
+           Saved on this device. Tap <strong>Export</strong> to keep a <code>${SESSIONS_FILENAME}</code> backup (Files / iCloud) or to move data to another device.
+         </div>` : '';
+
+    const saveChip = ({
+      saving: '<span class="text-xs text-slate-500">Saving…</span>',
+      saved:  '<span class="text-xs text-emerald-600">All changes saved</span>',
+      error:  '<span class="text-xs text-red-600">Save failed</span>',
+      idle:   '',
+    })[s.saveState] || '';
+
+    const exportDisabled = state.sessions.length === 0;
+
+    $('#data-panel').innerHTML = `
+      <div class="bg-white border-b border-slate-200 shadow-sm">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4">
+          <div class="flex items-center justify-between gap-4 mb-3">
+            <div class="flex items-center gap-3">
+              <div class="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center">
+                <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+              </div>
+              <div>
+                <h1 class="text-lg font-bold text-slate-900 leading-tight">Skills Assessment Console</h1>
+                <p class="text-xs text-slate-500">${s.mode === 'fsapi' ? 'Auto-save mode (Chrome/Edge)' : 'On-device mode — saved in this browser'}</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3">
+              ${saveChip}
+              ${btn('export-sessions', 'Export ' + SESSIONS_FILENAME, 'primary', exportDisabled)}
+            </div>
+          </div>
+          ${reconnectBanner}
+          <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div class="rounded-lg border border-slate-200 p-3">
+              <div class="flex items-center justify-between gap-2 mb-2">
+                <span class="text-sm font-semibold text-slate-700">Questions Bank</span>
+                <span class="text-sm">${bankStatus}</span>
+              </div>
+              <div class="flex flex-wrap gap-2">${questionsControls}</div>
+            </div>
+            <div class="rounded-lg border border-slate-200 p-3">
+              <div class="flex items-center justify-between gap-2 mb-2">
+                <span class="text-sm font-semibold text-slate-700">Session History</span>
+                <span class="text-sm">${sessStatus}</span>
+              </div>
+              <div class="flex flex-wrap gap-2">${sessionsControls}</div>
+            </div>
+            <div class="rounded-lg border border-slate-200 p-3">
+              <div class="flex items-center justify-between gap-2 mb-2">
+                <span class="text-sm font-semibold text-slate-700">Favorites</span>
+                <span class="text-sm">${status(favLoaded, s.favoritesName, Favorites.set.size ? Favorites.set.size + ' saved locally' : 'none')}</span>
+              </div>
+              <div class="flex flex-wrap gap-2">${favoritesControls}</div>
+            </div>
+          </div>
+          ${dirtyBanner}
+        </div>
+      </div>`;
+  }
+
+  /* ---- Small HTML builders ---- */
+
+  function btn(action, label, variant = 'secondary', disabled = false) {
+    const styles = {
+      primary:   'bg-indigo-600 text-white hover:bg-indigo-700',
+      secondary: 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50',
+      amber:     'bg-amber-500 text-white hover:bg-amber-600',
+      danger:    'bg-white text-red-600 border border-red-300 hover:bg-red-50',
+      ghost:     'text-slate-600 hover:text-slate-900',
+    }[variant];
+    const dis = disabled ? 'opacity-40 cursor-not-allowed pointer-events-none' : '';
+    return `<button data-action="${action}" class="text-sm font-medium px-3.5 py-2 rounded-lg transition ${styles} ${dis}">${esc(label)}</button>`;
+  }
+
+  function fileInput(action, label) {
+    return `<label class="text-sm font-medium px-3.5 py-2 rounded-lg bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 cursor-pointer transition">
+      ${esc(label)}
+      <input type="file" accept="application/json,.json" data-action="${action}" class="hidden" />
+    </label>`;
+  }
+
+  /* ---- Dashboard view ---- */
+
+  function viewDashboard() {
+    const noBankBanner = !state.bank
+      ? `<div class="mb-5 rounded-xl bg-indigo-50 border border-indigo-200 px-4 py-3 text-indigo-800 flex items-center gap-2">
+           <svg class="w-5 h-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4m0 4h.01"/><circle cx="12" cy="12" r="10"/></svg>
+           <span>Upload your <strong>question bank</strong> in the panel above to start new assessments.</span>
+         </div>` : '';
+
+    return `
+      ${noBankBanner}
+      <div class="flex items-center justify-between gap-4 mb-5">
+        <h2 class="text-2xl font-bold text-slate-900">Assessment Dashboard</h2>
+        <div class="flex items-center gap-3">
+          ${btn('open-analytics', 'Analytics', 'secondary', state.sessions.length === 0)}
+          ${btn('open-compare', 'Compare', 'secondary', state.sessions.length < 2)}
+          ${btn('open-new-session', '+ New Session', 'primary', !state.bank)}
+        </div>
+      </div>
+      ${dashboardTable()}`;
+  }
+
+  function dashboardTable() {
+    if (!state.sessions.length) {
+      return `<div class="bg-white rounded-xl border border-slate-200 p-10 text-center text-slate-500">
+        No sessions yet — start one with <strong>+ New Session</strong>, or load a history file above.
+      </div>`;
+    }
+    const rows = state.sessions
+      .slice()
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+      .map(s => {
+        const avgs = Object.values(sessionAverages(s));
+        const overall = avgs.length ? round2(avgs.reduce((x, y) => x + y, 0) / avgs.length) : null;
+        return `<tr data-session-row data-name="${esc((s.engineerName||'').toLowerCase())}" data-position="${esc((s.position||'').toLowerCase())}"
+                    class="border-t border-slate-100 hover:bg-slate-50">
+          <td class="px-4 py-3 text-sm text-slate-600 whitespace-nowrap">${esc(s.date)}</td>
+          <td class="px-4 py-3 text-sm font-medium text-slate-900">${esc(s.engineerName)}</td>
+          <td class="px-4 py-3 text-sm text-slate-600">${esc(s.position)}</td>
+          <td class="px-4 py-3 text-sm">${overall == null ? '<span class="text-slate-400">—</span>'
+            : `<span class="inline-block px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-semibold">${overall.toFixed(1)}</span>`}</td>
+          <td class="px-4 py-3 text-right">${btn('view-profile', 'View', 'secondary').replace('data-action="view-profile"', `data-action="view-profile" data-id="${esc(s.id)}"`)}</td>
+        </tr>`;
+      }).join('');
+
+    return `
+      <div class="mb-4">
+        <input data-action="search-input" type="text" placeholder="Search by engineer or position…"
+               value="${esc(state.dashboard.search)}"
+               class="w-full sm:w-96 px-4 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none text-sm" />
+      </div>
+      <div class="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <table class="w-full">
+          <thead class="bg-slate-50">
+            <tr class="text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <th class="px-4 py-3">Date</th><th class="px-4 py-3">Engineer</th>
+              <th class="px-4 py-3">Position</th><th class="px-4 py-3">Overall</th>
+              <th class="px-4 py-3 text-right">Profile</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  /** Post-render hook for the dashboard: re-apply the search filter. */
+  function afterDashboard() {
+    applySearchFilter(state.dashboard.search);
+  }
+
+  /* ---- Compare view (any number of sessions: overlaid radar + per-question table) ---- */
+
+  /** Resolve the selected session ids to session objects, preserving selection order. */
+  function compareSessions() {
+    return state.compare.selected.map(id => state.sessions.find(s => s.id === id)).filter(Boolean);
+  }
+
+  /** Ordered [{ category, questions:[{ question, scores:{ [sessionId]: score } }] }] across the
+   *  given sessions; the same (category, question) is one row, categories follow bank order. */
+  function compareMatrix(sessions) {
+    const order = bankCats();
+    const cats = [];
+    const catMap = new Map();
+    sessions.forEach(s => {
+      Object.keys(s.responses || {}).forEach(cat => {
+        scoredResponses(s.responses[cat]).forEach(r => {
+          if (!catMap.has(cat)) { catMap.set(cat, new Map()); cats.push(cat); }
+          const qm = catMap.get(cat);
+          const q = r.question || '(custom question)';
+          if (!qm.has(q)) qm.set(q, { question: q, scores: {} });
+          qm.get(q).scores[s.id] = r.score;
+        });
+      });
+    });
+    cats.sort((a, b) => {
+      const ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia === -1 ? 1e9 : ia) - (ib === -1 ? 1e9 : ib);
+    });
+    return cats.map(cat => ({ category: cat, questions: [...catMap.get(cat).values()] }));
+  }
+
+  function viewCompare() {
+    const sessions = compareSessions();
+    const all = state.sessions.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const list = all.map(s => {
+      const checked = state.compare.selected.includes(s.id);
+      const ci = state.compare.selected.indexOf(s.id);
+      const dot = checked
+        ? `<span class="inline-block w-2.5 h-2.5 rounded-full shrink-0" style="background:${PALETTE[ci % PALETTE.length].border}"></span>`
+        : '<span class="inline-block w-2.5 h-2.5 shrink-0"></span>';
+      return `<label data-compare-row data-name="${esc((s.engineerName||'').toLowerCase())}" data-position="${esc((s.position||'').toLowerCase())}"
+                class="flex items-center gap-2 px-3 py-2 rounded-lg border ${checked ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200 hover:bg-slate-50'} cursor-pointer text-sm">
+        <input type="checkbox" data-action="toggle-compare-session" data-id="${esc(s.id)}" ${checked ? 'checked' : ''} class="accent-indigo-600 shrink-0" />
+        ${dot}
+        <span class="flex-1 min-w-0 truncate"><span class="font-medium text-slate-900">${esc(s.engineerName)}</span><span class="text-slate-500"> · ${esc(s.date)} · ${esc(s.position)}</span></span>
+      </label>`;
+    }).join('');
+
+    const radarBlock = sessions.length
+      ? `<div class="h-[34rem]"><canvas id="compare-chart"></canvas></div>
+         ${sessions.length < 2 ? '<p class="text-xs text-slate-400 mt-2">Pick at least one more session to compare against.</p>' : ''}`
+      : `<div class="h-[34rem] flex items-center justify-center text-slate-400 text-sm">Select sessions on the left to plot them.</div>`;
+
+    return `
+      <div class="mb-5">
+        <button data-action="back-to-dashboard" class="text-sm text-slate-500 hover:text-slate-800 mb-1">← Back to dashboard</button>
+        <h2 class="text-2xl font-bold text-slate-900">Compare</h2>
+        <p class="text-sm text-slate-500">Overlay any sessions on the radar and line up their per-question scores.</p>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
+        <aside class="bg-white rounded-xl border border-slate-200 p-3 h-max lg:sticky lg:top-4 space-y-3">
+          <input data-action="compare-search" type="text" placeholder="Filter by engineer or position…"
+                 value="${esc(state.compare.search)}"
+                 class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm" />
+          <div class="flex items-center justify-between text-xs text-slate-500 px-1">
+            <span>${sessions.length} selected</span>
+            ${sessions.length ? btn('clear-compare', 'Clear', 'ghost') : ''}
+          </div>
+          <div class="space-y-1.5 max-h-[34rem] overflow-auto pr-1">${list || '<p class="text-sm text-slate-400">No sessions yet.</p>'}</div>
+        </aside>
+        <section class="space-y-6">
+          <div class="bg-white rounded-xl border border-slate-200 p-5">
+            <h3 class="font-semibold text-slate-900 mb-1">Competency Radar</h3>
+            <p class="text-xs text-slate-500 mb-3">Difficulty-weighted axis scores per session.</p>
+            ${radarBlock}
+          </div>
+          <div class="bg-white rounded-xl border border-slate-200 p-5">
+            <h3 class="font-semibold text-slate-900 mb-3">Per-question scores</h3>
+            ${compareTable(sessions)}
+          </div>
+        </section>
+      </div>`;
+  }
+
+  function compareTable(sessions) {
+    if (!sessions.length) return '<p class="text-sm text-slate-400">Select sessions to see their question-by-question scores.</p>';
+    const matrix = compareMatrix(sessions);
+    if (!matrix.length) return '<p class="text-sm text-slate-400">The selected sessions have no per-question detail.</p>';
+    const tone = v => v < 5 ? 'bg-red-50 text-red-700' : v < 7 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700';
+    const head = sessions.map((s, i) =>
+      `<th class="px-3 py-2 text-center font-semibold">
+         <span class="inline-flex items-center gap-1.5">
+           <span class="inline-block w-2.5 h-2.5 rounded-full" style="background:${PALETTE[i % PALETTE.length].border}"></span>
+           <span class="whitespace-nowrap">${esc(s.engineerName)} <span class="text-slate-400 font-normal">${esc(s.date)}</span></span>
+         </span>
+       </th>`).join('');
+    const body = matrix.map(group => {
+      const catRow = `<tr class="bg-slate-50"><td colspan="${sessions.length + 1}" class="px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">${esc(group.category)}</td></tr>`;
+      const qRows = group.questions.map(q => {
+        const cells = sessions.map(s => {
+          const v = q.scores[s.id];
+          return `<td class="px-3 py-2 text-center">${v == null
+            ? '<span class="text-slate-300">—</span>'
+            : `<span class="inline-block min-w-[2rem] px-2 py-0.5 rounded-full text-sm font-semibold ${tone(v)}">${v}</span>`}</td>`;
+        }).join('');
+        return `<tr class="border-t border-slate-100 align-top">
+          <td class="px-3 py-2 text-sm text-slate-700 max-w-md">${esc(q.question)}</td>${cells}
+        </tr>`;
+      }).join('');
+      return catRow + qRows;
+    }).join('');
+    return `<div class="overflow-auto">
+      <table class="w-full">
+        <thead><tr class="text-left text-xs font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-200">
+          <th class="px-3 py-2">Question</th>${head}
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+  }
+
+  /** Post-render hook for the compare view: re-apply the list filter and draw the overlaid radar. */
+  function afterCompare() {
+    applyCompareFilter(state.compare.search);
+    const sessions = compareSessions();
+    const canvas = $('#compare-chart');
+    if (sessions.length && canvas) Charts.renderCompareMulti(canvas, sessions);
+  }
+
+  function applyCompareFilter(query) {
+    const q = String(query || '').toLowerCase();
+    document.querySelectorAll('[data-compare-row]').forEach(row => {
+      row.classList.toggle('hidden', !(row.dataset.name.includes(q) || row.dataset.position.includes(q)));
+    });
+  }
+
+  function applySearchFilter(query) {
+    const q = String(query || '').toLowerCase();
+    document.querySelectorAll('[data-session-row]').forEach(row => {
+      const match = row.dataset.name.includes(q) || row.dataset.position.includes(q);
+      row.classList.toggle('hidden', !match);
+    });
+  }
+
+  /* ---- Evaluation view ---- */
+
+  function chipCls(done) {
+    return 'text-xs font-semibold px-2 py-0.5 rounded-full ' +
+      (done ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600');
+  }
+
+  /* ---- Level grouping + score-control helpers ---- */
+
+  /** Primary numeric level from a level string ("Level 1-2 (Alt)" -> "1"); "custom" when none. */
+  function levelKey(levelStr) {
+    const m = String(levelStr || '').match(/\d+/);
+    return m ? m[0] : 'custom';
+  }
+  function levelLabel(key) { return key == null ? '' : (key === 'custom' ? 'Custom' : 'L' + key); }
+
+  /** Visual palette per level (tab fill, badge, and left-accent bar colour), with a slate fallback. */
+  function levelColor(key) {
+    return ({
+      '1': { tab: 'bg-emerald-600', badge: 'bg-emerald-100 text-emerald-700', bar: '#10b981' },
+      '2': { tab: 'bg-sky-600',     badge: 'bg-sky-100 text-sky-700',         bar: '#0ea5e9' },
+      '3': { tab: 'bg-amber-600',   badge: 'bg-amber-100 text-amber-700',     bar: '#f59e0b' },
+      '4': { tab: 'bg-rose-600',    badge: 'bg-rose-100 text-rose-700',       bar: '#f43f5e' },
+      '5': { tab: 'bg-purple-600',  badge: 'bg-purple-100 text-purple-700',   bar: '#a855f7' },
+    })[key] || { tab: 'bg-slate-600', badge: 'bg-slate-200 text-slate-700', bar: '#94a3b8' };
+  }
+
+  /** Group response indices by level key. */
+  function levelGroups(responses) {
+    const groups = {};
+    (responses || []).forEach((r, i) => {
+      const k = r.custom ? 'custom' : levelKey(r.level);
+      (groups[k] = groups[k] || []).push(i);
+    });
+    return groups;
+  }
+  /** Ordered level keys: numeric ascending, then 'custom' last. */
+  function orderedLevelKeys(groups) {
+    const nums = Object.keys(groups).filter(k => k !== 'custom').sort((a, b) => +a - +b);
+    return groups.custom ? [...nums, 'custom'] : nums;
+  }
+  /** Count of scored questions within one level of a category. */
+  function levelScoredCount(responses, key) {
+    return (responses || []).filter(r => (r.custom ? 'custom' : levelKey(r.level)) === key && isValidScore(r.score)).length;
+  }
+
+  function levelTabCls(key, active) {
+    const c = levelColor(key);
+    return active
+      ? `inline-flex items-center px-4 py-2 rounded-lg text-sm font-semibold text-white ${c.tab} transition`
+      : 'inline-flex items-center px-4 py-2 rounded-lg text-sm font-medium text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 transition';
+  }
+  /** A single number button in the 1–10 score selector. */
+  function scoreBtnCls(on) {
+    return 'w-10 h-10 rounded-lg text-sm font-semibold border transition ' +
+      (on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:border-indigo-400 hover:bg-indigo-50');
+  }
+
+  function viewEvaluation() {
+    const a = state.active;
+    const cats = bankCats();
+    const activeCat = a.activeCategory;
+    const activeIdx = cats.indexOf(activeCat);
+
+    // Sidebar — counter = number of scored questions in the category.
+    const sidebar = cats.map((cat, i) => {
+      const n = scoredResponses(a.responses[cat]).length;
+      const done = n >= 3;
+      const isActive = cat === activeCat;
+      const bad = a.showValidation && !done;
+      const ring = bad ? 'ring-2 ring-red-400 bg-red-50' : '';
+      const activeCls = isActive ? 'bg-indigo-50 text-indigo-700 font-semibold' : 'text-slate-700 hover:bg-slate-50';
+      return `<button data-action="switch-category" data-cat-idx="${i}"
+                class="w-full flex items-center justify-between gap-2 text-left px-3 py-2.5 rounded-lg transition ${activeCls} ${ring}">
+        <span class="text-sm">${esc(cat)}</span>
+        <span class="${chipCls(done)}">${done ? '✓ ' + n : n + '/3'}</span>
+      </button>`;
+    }).join('');
+
+    // Group this category's questions into level tabs (L1, L2, … then Custom).
+    const responses = a.responses[activeCat] || [];
+    const groups = levelGroups(responses);
+    const levelKeys = orderedLevelKeys(groups);
+    if (!levelKeys.includes(a.activeLevel)) a.activeLevel = levelKeys[0] || null;
+    const activeLevel = a.activeLevel;
+
+    const tabs = levelKeys.map(k => {
+      const isActive = k === activeLevel;
+      const scored = levelScoredCount(responses, k);
+      return `<button data-action="switch-level" data-level="${k}" class="${levelTabCls(k, isActive)}">
+        ${esc(levelLabel(k))}<span class="ml-1.5 text-xs ${isActive ? 'text-white/80' : 'text-slate-400'}">${scored ? '· ' + scored : ''}</span>
+      </button>`;
+    }).join('');
+
+    const visible = groups[activeLevel] || [];
+    const cards = visible.map(i => questionCard(activeIdx, i, responses[i])).join('') ||
+      '<p class="text-sm text-slate-400">No reference questions here — add a custom question below.</p>';
+    const n = scoredResponses(responses).length;
+
+    return `
+      <div class="flex items-center justify-between gap-4 mb-5">
+        <div>
+          <button data-action="cancel-assessment" class="text-sm text-slate-500 hover:text-slate-800 mb-1">← Cancel</button>
+          <h2 class="text-2xl font-bold text-slate-900">${esc(a.engineerName)}</h2>
+          <p class="text-sm text-slate-500">${esc(a.position)} · ${esc(a.date)}</p>
+        </div>
+        ${btn('finish-assessment', 'Finish Assessment', 'primary')}
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-6">
+        <aside class="bg-white rounded-xl border border-slate-200 p-3 h-max lg:sticky lg:top-4 space-y-1">
+          <p class="text-xs font-semibold uppercase tracking-wide text-slate-400 px-3 pt-1 pb-2">Categories</p>
+          ${sidebar}
+        </aside>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <h3 class="text-lg font-bold text-slate-900">${esc(activeCat)}</h3>
+            <span class="${chipCls(n >= 3)}">${n >= 3 ? '✓ ' + n + ' scored' : n + '/3 minimum'}</span>
+          </div>
+          <div class="flex flex-wrap gap-2">${tabs}</div>
+          <div class="space-y-4">${cards}</div>
+          ${btn('add-question', '+ Add custom question', 'secondary')}
+        </section>
+      </div>`;
+  }
+
+  /** A single scorable question: level badge + accent, question text, guidance, 1–10 click selector, notes. */
+  function questionCard(catIdx, qIdx, r) {
+    const lvlK = r.custom ? 'custom' : levelKey(r.level);
+    const c = levelColor(lvlK);
+    const factor = levelFactor(r.level, r.custom);
+    const cat = bankCats()[catIdx];
+    const fav = !r.custom && Favorites.has(cat, r.question);
+
+    const guidance = (r.what_it_reveals || r.what_to_look_for || r.follow_up) ? `
+      <details class="mt-2">
+        <summary class="cursor-pointer select-none text-xs font-medium text-indigo-600 list-none">Interviewer guidance ▾</summary>
+        <div class="mt-2 space-y-1 text-sm text-slate-600">
+          ${r.what_it_reveals ? `<p><span class="font-semibold">Reveals:</span> ${esc(r.what_it_reveals)}</p>` : ''}
+          ${r.what_to_look_for ? `<p><span class="font-semibold">Look for:</span> ${esc(r.what_to_look_for)}</p>` : ''}
+          ${r.follow_up ? `<p><span class="font-semibold">Follow-up:</span> ${esc(r.follow_up)}</p>` : ''}
+        </div>
+      </details>` : '';
+
+    const levelBadge = `<span class="inline-block shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full ${c.badge}">${esc(r.level || 'Custom')}</span>`;
+
+    const questionEl = r.custom
+      ? `<input type="text" data-action="q-text" data-cat-idx="${catIdx}" data-q-idx="${qIdx}" value="${esc(r.question)}"
+                placeholder="Type the custom question…"
+                class="w-full text-sm font-medium text-slate-800 px-2 py-1.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none" />`
+      : `<p class="text-sm text-slate-800">${esc(r.question)}</p>`;
+
+    const removeBtn = r.custom
+      ? `<button data-action="remove-question" data-cat-idx="${catIdx}" data-q-idx="${qIdx}" class="shrink-0 text-slate-400 hover:text-red-600 transition" title="Remove question">
+           <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+         </button>` : '';
+
+    // Star toggle — only bank questions (custom questions are session-ephemeral and don't recur).
+    const favBtn = r.custom ? '' : `<button data-action="toggle-favorite" data-cat-idx="${catIdx}" data-q-idx="${qIdx}"
+           class="shrink-0 ${fav ? 'text-amber-500' : 'text-slate-300 hover:text-amber-400'} transition" title="${fav ? 'Remove from favorites' : 'Add to favorites'}">
+           <svg class="w-5 h-5" viewBox="0 0 24 24" fill="${fav ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M12 2.5l2.9 5.88 6.49.94-4.7 4.58 1.11 6.46L12 17.77l-5.8 3.05 1.11-6.46-4.7-4.58 6.49-.94L12 2.5z"/></svg>
+         </button>`;
+
+    // Clickable 1–10 selector; click the active number again to clear.
+    const scale = Array.from({ length: 10 }, (_, k) => k + 1).map(v =>
+      `<button type="button" data-action="q-score-set" data-cat-idx="${catIdx}" data-q-idx="${qIdx}" data-score="${v}"
+               class="${scoreBtnCls(r.score === v)}">${v}</button>`).join('');
+
+    const scored = isValidScore(r.score);
+    return `<div class="bg-white rounded-xl border ${scored ? 'border-emerald-300' : 'border-slate-200'} p-4" style="border-left:4px solid ${c.bar}">
+      <div class="flex items-start gap-2">
+        ${levelBadge}
+        <div class="flex-1 min-w-0">${questionEl}</div>
+        ${favBtn}
+        ${removeBtn}
+      </div>
+      ${guidance}
+      <div class="mt-3">
+        <label class="block text-xs font-medium text-slate-500 mb-1.5">Score — click to set <span class="text-slate-400 font-normal">· counts ×${factor.toFixed(2)}</span></label>
+        <div class="flex flex-wrap gap-1.5">${scale}</div>
+      </div>
+      <div class="mt-3">
+        <label class="block text-xs font-medium text-slate-500 mb-1">Notes (optional)</label>
+        <textarea data-action="q-notes" data-cat-idx="${catIdx}" data-q-idx="${qIdx}" rows="2"
+                  placeholder="What they said, examples, red/green flags…"
+                  class="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none text-sm">${esc(r.notes || '')}</textarea>
+      </div>
+    </div>`;
+  }
+
+  /* ---- Profile view ---- */
+
+  function viewProfile() {
+    const s = state.sessions.find(x => x.id === state.profile.sessionId);
+    if (!s) { state.view = 'dashboard'; return viewDashboard(); }
+
+    const axes = sessionAxes(s);
+    const breakdown = axes.map(cat => categoryBreakdownCard(s, cat)).join('');
+
+    const role = mapPosition(s.position);
+    const targetNote = role
+      ? `Dashed overlay = expectations for <strong>${esc(s.position)}</strong>.`
+      : `No role overlay (unrecognised position "${esc(s.position)}").`;
+
+    return `
+      <div id="report">
+        <div class="flex items-start justify-between gap-4 mb-5">
+          <div>
+            <button data-action="back-to-dashboard" class="text-sm text-slate-500 hover:text-slate-800 mb-1 no-print">← Back to dashboard</button>
+            <h2 class="text-2xl font-bold text-slate-900">${esc(s.engineerName)}</h2>
+            <p class="text-sm text-slate-500">${esc(s.position)} · Assessed ${esc(s.date)}</p>
+          </div>
+          <div class="flex items-center gap-2">
+            ${btn('print-report', 'Print / Save PDF', 'secondary').replace('class="', 'class="no-print ')}
+            ${btn('delete-session', 'Delete', 'danger')
+              .replace('data-action="delete-session"', `data-action="delete-session" data-id="${esc(s.id)}"`)
+              .replace('class="', 'class="no-print ')}
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-200 p-5 mb-6 print-card print-break-avoid">
+          <h3 class="font-semibold text-slate-900 mb-1">Competency Radar</h3>
+          <p class="text-xs text-slate-500 mb-3">${targetNote} Axis scores are difficulty-weighted — harder questions count more.</p>
+          <div class="h-[34rem]"><canvas id="profile-chart"></canvas></div>
+        </div>
+
+        <h3 class="font-semibold text-slate-900 mb-3">Per-question breakdown</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">${breakdown}</div>
+      </div>`;
+  }
+
+  /** One category card in the profile: average + each scored question with its score and notes.
+   *  Falls back to the legacy (scores + per-category note) shape for files saved before per-question detail. */
+  function categoryBreakdownCard(s, cat) {
+    const avg = avgOf(s, cat);
+    const header = `<div class="flex items-center justify-between mb-2">
+        <h4 class="font-semibold text-slate-900">${esc(cat)}</h4>
+        <span class="inline-block px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-semibold text-sm">${avg == null ? '—' : avg.toFixed(2)}</span>
+      </div>`;
+
+    let body;
+    if (s.responses && s.responses[cat]) {
+      body = scoredResponses(s.responses[cat]).map(r => `
+        <div class="py-2 border-t border-slate-100 first:border-t-0">
+          <div class="flex items-start justify-between gap-3">
+            <p class="text-sm text-slate-700">${esc(r.question || '(custom question)')}</p>
+            <span class="shrink-0 inline-block px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 font-semibold text-xs">${esc(r.score)}</span>
+          </div>
+          ${r.notes ? `<p class="text-sm text-slate-500 mt-1 whitespace-pre-wrap">${esc(r.notes)}</p>` : ''}
+        </div>`).join('') || '<p class="text-sm text-slate-400">No scored questions.</p>';
+    } else {
+      const scores = validNumbers(s.scores ? s.scores[cat] : []);
+      body = `<p class="text-xs text-slate-500 mb-1">Scores: ${scores.length ? scores.join(', ') : '—'}</p>
+        ${s.notes && s.notes[cat] ? `<p class="text-sm text-slate-700 whitespace-pre-wrap">${esc(s.notes[cat])}</p>` : '<p class="text-sm text-slate-400 italic">No notes.</p>'}`;
+    }
+    return `<div class="rounded-lg border border-slate-200 p-4 print-card print-break-avoid">${header}${body}</div>`;
+  }
+
+  /** Render the profile chart after its canvas exists in the DOM. */
+  function afterProfile() {
+    const s = state.sessions.find(x => x.id === state.profile.sessionId);
+    const canvas = $('#profile-chart');
+    if (s && canvas) Charts.renderProfile(canvas, s);
+  }
+
+  /* ---- Analytics view ---- */
+
+  function viewAnalytics() {
+    // Top performer per category (works for any saved session via averages).
+    const leaders = categoryLeaders(state.sessions);
+    const leaderCards = Object.keys(leaders).length
+      ? Object.keys(leaders).map(cat => `
+        <div class="rounded-lg border border-slate-200 p-4">
+          <p class="text-xs uppercase tracking-wide text-slate-400 mb-1">${esc(cat)}</p>
+          <p class="font-semibold text-slate-900">${esc(leaders[cat].engineer)}</p>
+          <p class="text-sm text-slate-500">${leaders[cat].avg.toFixed(2)} avg · ${esc(leaders[cat].date)}</p>
+        </div>`).join('')
+      : '<p class="text-sm text-slate-400">No sessions yet.</p>';
+
+    // Per-question stats (only sessions saved with per-question detail), hardest first.
+    const qs = aggregateQuestions(state.sessions).sort((a, b) => a.avg - b.avg);
+    const tone = v => v < 5 ? 'bg-red-50 text-red-700' : v < 7 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700';
+    const qTable = qs.length
+      ? `<div class="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table class="w-full">
+            <thead class="bg-slate-50">
+              <tr class="text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <th class="px-4 py-3">Question</th><th class="px-4 py-3">Category</th>
+                <th class="px-4 py-3 text-center">Asked</th><th class="px-4 py-3 text-center">Avg</th>
+                <th class="px-4 py-3">Best performer</th>
+              </tr>
+            </thead>
+            <tbody>${qs.map(q => `
+              <tr class="border-t border-slate-100 align-top">
+                <td class="px-4 py-3 text-sm text-slate-700 max-w-md">${esc(q.question)}</td>
+                <td class="px-4 py-3 text-sm text-slate-500 whitespace-nowrap">${esc(q.category)}</td>
+                <td class="px-4 py-3 text-sm text-center text-slate-600">${q.count}</td>
+                <td class="px-4 py-3 text-center"><span class="inline-block px-2 py-0.5 rounded-full font-semibold text-sm ${tone(q.avg)}">${q.avg.toFixed(2)}</span></td>
+                <td class="px-4 py-3 text-sm whitespace-nowrap text-slate-700">${esc(q.best.engineer)} <span class="text-slate-400">(${esc(q.best.score)})</span></td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>`
+      : `<div class="bg-white rounded-xl border border-slate-200 p-10 text-center text-slate-500">
+          Per-question analytics appear once you finish sessions scored question-by-question.
+        </div>`;
+
+    return `
+      <div class="mb-5">
+        <button data-action="back-to-dashboard" class="text-sm text-slate-500 hover:text-slate-800 mb-1">← Back to dashboard</button>
+        <h2 class="text-2xl font-bold text-slate-900">Analytics</h2>
+      </div>
+      <h3 class="font-semibold text-slate-900 mb-3">Top performer per category</h3>
+      <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-8">${leaderCards}</div>
+      <h3 class="font-semibold text-slate-900 mb-3">Questions — hardest first (lowest average), with who answered best</h3>
+      ${qTable}`;
+  }
+
+  /* ---- Modal ---- */
+
+  function renderModal() {
+    const root = $('#modal-root');
+    if (state.ui.modal !== 'new-session') { root.innerHTML = ''; return; }
+    const opts = POSITIONS.map(p => `<option value="${esc(p.value)}">${esc(p.label)}</option>`).join('');
+    root.innerHTML = `
+      <div class="fixed inset-0 z-40 bg-slate-900/40 flex items-center justify-center p-4 no-print" data-action="close-modal" data-overlay>
+        <div class="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
+          <h3 class="text-lg font-bold text-slate-900 mb-4">New Assessment Session</h3>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Full Name</label>
+          <input id="ns-name" type="text" placeholder="e.g. Jane Doe"
+                 class="w-full mb-4 px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm" />
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Target Position / Seniority</label>
+          <select id="ns-position" class="w-full mb-6 px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm">${opts}</select>
+          <div class="flex justify-end gap-3">
+            ${btn('close-modal', 'Cancel', 'ghost')}
+            ${btn('create-session', 'Start Assessment', 'primary')}
+          </div>
+        </div>
+      </div>`;
+    setTimeout(() => { const el = $('#ns-name'); if (el) el.focus(); }, 0);
+  }
+
+  /* ------------------------------------------------------------------ 8. Actions */
+
+  function startSession(name, position) {
+    // Seed one response object per bank question. Guidance fields ride along for display only;
+    // they are stripped before persisting (see finishAssessment).
+    const responses = {};
+    bankCats().forEach(cat => {
+      responses[cat] = (state.bank.categories[cat] || []).map(q => ({
+        question: q.question || '', level: q.level || '', custom: false, score: null, notes: '',
+        what_it_reveals: q.what_it_reveals || '', what_to_look_for: q.what_to_look_for || '', follow_up: q.follow_up || '',
+      }));
+    });
+    state.active = {
+      id: uuid(), date: todayISO(), engineerName: name, position,
+      activeCategory: bankCats()[0], activeLevel: null, responses, showValidation: false,
+    };
+    state.ui.modal = null;
+    state.view = 'evaluation';
+    render();
+  }
+
+  function finishAssessment() {
+    const { ok, missing } = validateSession(state.active, state.bank);
+    if (!ok) {
+      state.active.showValidation = true;
+      render();
+      alert('Cannot finish yet. These categories need at least 3 scores:\n\n• ' + missing.join('\n• '));
+      return;
+    }
+    const a = state.active;
+    const responses = {}, scores = {};
+    bankCats().forEach(cat => {
+      // Persist only scored questions, and only the durable fields (drop interviewer guidance).
+      const sr = scoredResponses(a.responses[cat]);
+      responses[cat] = sr.map(r => ({ question: r.question, level: r.level, custom: !!r.custom, score: r.score, notes: r.notes || '' }));
+      scores[cat] = sr.map(r => r.score);
+    });
+    const session = {
+      id: a.id, date: a.date, engineerName: a.engineerName, position: a.position,
+      scores, averages: computeWeightedAverages(responses), responses,
+    };
+    state.sessions.push(session);
+    state.active = null;
+    state.view = 'dashboard';
+    state.profile.sessionId = null;
+    Storage.saveSessions();
+    render();
+    if (state.storage.mode === 'fsapi' && state.storage.sessionsHandle) {
+      showToast('Saved — written to ' + state.storage.sessionsName, 'success');
+    } else {
+      showToast('Session complete. Remember to Export your sessions.json.', 'warn');
+    }
+  }
+
+  // Click actions, keyed by data-action.
+  const clickActions = {
+    'connect-questions': () => Storage.connectQuestions(),
+    'open-sessions':     () => Storage.openSessions(),
+    'create-sessions':   () => Storage.createSessions(),
+    'reconnect-files':   () => Storage.reconnect(),
+    'export-sessions':   () => Storage.exportSessions(),
+    'open-favorites':    () => Storage.connectFavorites(),
+    'create-favorites':  () => Storage.createFavorites(),
+    'export-favorites':  () => Storage.exportFavorites(),
+
+    'open-new-session':  () => { if (state.bank) { state.ui.modal = 'new-session'; renderModal(); } },
+    'close-modal':       (ds, e) => {
+      // The matched node is the backdrop when it carries data-overlay; the Cancel button does not.
+      // For a backdrop match, close only if the backdrop itself was the target — not a click that
+      // bubbled up from inside the dialog body.
+      const fromBackdrop = ds.overlay !== undefined;
+      if (fromBackdrop && !(e.target.hasAttribute && e.target.hasAttribute('data-overlay'))) return;
+      state.ui.modal = null; renderModal();
+    },
+    'create-session': () => {
+      const name = ($('#ns-name').value || '').trim();
+      const position = $('#ns-position').value;
+      if (!name) { showToast('Please enter the engineer’s name.', 'warn'); $('#ns-name').focus(); return; }
+      startSession(name, position);
+    },
+
+    'switch-category': (ds) => {
+      state.active.activeCategory = bankCats()[+ds.catIdx];
+      state.active.activeLevel = null;               // normalised to the first level in viewEvaluation
+      render();
+    },
+    'switch-level': (ds) => { state.active.activeLevel = ds.level; render(); },
+    'add-question': () => {
+      state.active.responses[state.active.activeCategory].push({
+        question: '', level: 'Custom', custom: true, score: null, notes: '',
+        what_it_reveals: '', what_to_look_for: '', follow_up: '',
+      });
+      state.active.activeLevel = 'custom';            // jump to the Custom tab to show the new row
+      render();
+      const inputs = document.querySelectorAll('[data-action="q-text"]');
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    },
+    'q-score-set': (ds) => {
+      const r = state.active.responses[bankCats()[+ds.catIdx]][+ds.qIdx];
+      const val = +ds.score;
+      r.score = (r.score === val) ? null : val;       // click the active number again to clear it
+      render();
+    },
+    'remove-question': (ds) => {
+      const cat = bankCats()[+ds.catIdx];
+      state.active.responses[cat].splice(+ds.qIdx, 1);
+      render();
+    },
+    'toggle-favorite': (ds) => {
+      const cat = bankCats()[+ds.catIdx];
+      const r = state.active.responses[cat][+ds.qIdx];
+      Favorites.toggle(cat, r.question);
+      render();
+    },
+    'open-analytics': () => { if (state.sessions.length) { state.view = 'analytics'; render(); } },
+    'finish-assessment': () => finishAssessment(),
+    'cancel-assessment': () => {
+      if (confirm('Discard this in-progress assessment? It has not been saved.')) {
+        state.active = null; state.view = 'dashboard'; render();
+      }
+    },
+
+    'view-profile': (ds) => { state.profile.sessionId = ds.id; state.view = 'profile'; render(); },
+    'back-to-dashboard': () => { state.profile.sessionId = null; state.view = 'dashboard'; render(); },
+    'print-report': () => window.print(),
+
+    'open-compare':   () => { if (state.sessions.length >= 2) { state.view = 'compare'; render(); } },
+    'clear-compare':  () => { state.compare.selected = []; render(); },
+    'delete-session': (ds) => {
+      const s = state.sessions.find(x => x.id === ds.id);
+      if (!s) return;
+      if (!confirm(`Delete ${s.engineerName}'s assessment from ${s.date}? This cannot be undone.`)) return;
+      state.sessions = state.sessions.filter(x => x.id !== ds.id);
+      state.compare.selected = state.compare.selected.filter(id => id !== ds.id);
+      state.profile.sessionId = null;
+      state.view = 'dashboard';
+      Storage.saveSessions();
+      render();
+      showToast('Deleted ' + s.engineerName + '’s ' + s.date + ' assessment.', 'success');
+    },
+  };
+
+  // Change actions (file inputs, select, checkboxes).
+  const changeActions = {
+    'file-questions': (ds, e) => readChosenFile(e.target.files[0], ingestQuestions),
+    'file-sessions':  (ds, e) => readChosenFile(e.target.files[0], ingestSessions),
+    'file-favorites': (ds, e) => readChosenFile(e.target.files[0], ingestFavorites),
+    'toggle-compare-session': (ds, e) => {
+      const id = ds.id;
+      const sel = state.compare.selected;
+      if (e.target.checked) { if (!sel.includes(id)) sel.push(id); }
+      else { state.compare.selected = sel.filter(x => x !== id); }
+      render();
+    },
+  };
+
+  // Input actions (typing).
+  const inputActions = {
+    'q-notes': (ds, e) => {
+      state.active.responses[bankCats()[+ds.catIdx]][+ds.qIdx].notes = e.target.value;  // silent
+    },
+    'q-text': (ds, e) => {
+      state.active.responses[bankCats()[+ds.catIdx]][+ds.qIdx].question = e.target.value; // silent
+    },
+    'search-input': (ds, e) => {
+      state.dashboard.search = e.target.value;       // persist for re-renders
+      applySearchFilter(e.target.value);             // filter live without re-render
+    },
+    'compare-search': (ds, e) => {
+      state.compare.search = e.target.value;
+      applyCompareFilter(e.target.value);
+    },
+  };
+
+  function readChosenFile(file, ingest) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { ingest(reader.result, file.name); render(); };
+    reader.onerror = () => showToast('Could not read the file.', 'error');
+    reader.readAsText(file);
+  }
+
+  /* ------------------------------------------------------------------ 9. Event wiring (delegation) */
+
+  function wire(containerId, eventType, actionMap) {
+    const container = $('#' + containerId);
+    container.addEventListener(eventType, (e) => {
+      const el = e.target.closest('[data-action]');
+      // For 'input'/'change' the event target itself carries data-action; for clicks use closest().
+      const node = (eventType === 'click') ? el
+        : (e.target.dataset && e.target.dataset.action ? e.target : null);
+      if (!node) return;
+      const handler = actionMap[node.dataset.action];
+      if (handler) handler(node.dataset, e);
+    });
+  }
+
+  function wireAll() {
+    ['data-panel', 'view-root', 'modal-root'].forEach(id => {
+      wire(id, 'click', clickActions);
+      wire(id, 'change', changeActions);
+      wire(id, 'input', inputActions);
+    });
+    // Escape closes the modal.
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && state.ui.modal) { state.ui.modal = null; renderModal(); }
+    });
+  }
+
+  /* ------------------------------------------------------------------ 10. Self-tests (?selftest=1) */
+
+  function runSelfTests() {
+    let pass = 0, fail = 0;
+    const eq = (label, got, want) => {
+      const ok = JSON.stringify(got) === JSON.stringify(want);
+      if (ok) pass++; else { fail++; console.error('FAIL:', label, '— got', got, 'want', want); }
+    };
+    eq('computeAverage [8,9,7]', computeAverage([8, 9, 7]), 8);
+    eq('computeAverage [4,5,5]', computeAverage([4, 5, 5]), 4.67);
+    eq('computeAverage drops invalid', computeAverage([5, 0, 11, 7, null]), 6);
+    eq('computeAverage empty', computeAverage([]), null);
+    eq('validNumbers filters', validNumbers([1, 10, 0, 11, 5.5, 5]), [1, 10, 5]);
+    eq('classifyAxis soft', classifyAxis('Delivery & Soft Skills'), 'soft');
+    eq('classifyAxis technical', classifyAxis('Backend Development'), 'technical');
+    eq('mapPosition senior', mapPosition('Senior Engineer'), 'senior');
+    eq('mapPosition techlead', mapPosition('Tech Lead'), 'techlead');
+    eq('mapPosition mid', mapPosition('Mid-Level'), 'mid');
+    eq('mapPosition unknown', mapPosition('Consultant'), null);
+    eq('resolveRoleTargets senior split',
+       resolveRoleTargets('Senior', ['Backend Development', 'Delivery & Soft Skills']),
+       { 'Backend Development': 8, 'Delivery & Soft Skills': 6 });
+    eq('resolveRoleTargets junior flat',
+       resolveRoleTargets('Junior', ['Backend Development', 'Delivery & Soft Skills']),
+       { 'Backend Development': 3, 'Delivery & Soft Skills': 3 });
+    eq('resolveRoleTargets unmapped', resolveRoleTargets('Consultant', ['X']), null);
+    eq('scoredResponses filters',
+       scoredResponses([{ score: 8 }, { score: 0 }, { score: 11 }, { notes: 'x' }, { score: 5 }]).length, 2);
+    eq('responsesToScores derives',
+       responsesToScores({ A: [{ score: 8 }, { score: 9 }, { score: 0 }] }), { A: [8, 9] });
+    eq('validateSession blocks (responses)',
+       validateSession({ responses: { A: [{ score: 1 }, { score: 2 }], B: [{ score: 1 }, { score: 2 }, { score: 3 }] } }, { categories: { A: [], B: [] } }),
+       { ok: false, missing: ['A'] });
+    eq('validateSession passes (responses)',
+       validateSession({ responses: { A: [{ score: 1 }, { score: 2 }, { score: 3 }] } }, { categories: { A: [] } }),
+       { ok: true, missing: [] });
+    eq('unionAxes merges',
+       unionAxes({ averages: { A: 1, B: 2 } }, { averages: { B: 3, C: 4 } }), ['A', 'B', 'C']);
+    const aggSessions = [
+      { engineerName: 'Ada', date: '2026-01-01', responses: { Backend: [{ question: 'Q1', score: 8 }, { question: 'Q2', score: 4 }] } },
+      { engineerName: 'Bo', date: '2026-02-01', responses: { Backend: [{ question: 'Q1', score: 6 }, { question: 'Q2', score: 9 }] } },
+    ];
+    const agg = aggregateQuestions(aggSessions);
+    eq('aggregateQuestions count', agg.length, 2);
+    const q1 = agg.find(q => q.question === 'Q1');
+    eq('aggregateQuestions Q1 avg', q1.avg, 7);
+    eq('aggregateQuestions Q1 best', q1.best.engineer, 'Ada');
+    eq('categoryLeaders picks top',
+       categoryLeaders([{ engineerName: 'Ada', date: 'd1', averages: { Backend: 7 } }, { engineerName: 'Bo', date: 'd2', averages: { Backend: 9 } }]).Backend.engineer, 'Bo');
+    eq('levelKey "Level 1 (1-2 pts)"', levelKey('Level 1 (1-2 pts)'), '1');
+    eq('levelKey "Level 4-5 (Alt)"', levelKey('Level 4-5 (Alternative)'), '4');
+    eq('levelKey custom', levelKey('Custom'), 'custom');
+    eq('orderedLevelKeys numeric then custom',
+       orderedLevelKeys({ '3': [0], '1': [1], custom: [2], '2': [3] }), ['1', '2', '3', 'custom']);
+    eq('levelScoredCount counts in level',
+       levelScoredCount([{ level: 'Level 1', score: 8 }, { level: 'Level 1', score: 0 }, { level: 'Level 2', score: 5 }], '1'), 1);
+    eq('levelFactor L1', levelFactor('Level 1 (1-2 pts)'), 0.5);
+    eq('levelFactor L4-5 -> 0.9', levelFactor('Level 4-5 (Alternative)'), 0.9);
+    eq('levelFactor custom', levelFactor('Custom', true), 1);
+    eq('levelFactor unknown -> custom default', levelFactor('No level here'), 1);
+    eq('computeWeightedAverage L1@10 -> 5', computeWeightedAverage([{ level: 'Level 1', score: 10 }]), 5);
+    eq('computeWeightedAverage L4-5@8 -> 7.2', computeWeightedAverage([{ level: 'Level 4-5 (Alternative)', score: 8 }]), 7.2);
+    eq('computeWeightedAverage all-levels@10 -> 7.7',
+       computeWeightedAverage([{ level: 'Level 1', score: 10 }, { level: 'Level 2', score: 10 }, { level: 'Level 3', score: 10 }, { level: 'Level 4', score: 10 }, { level: 'Level 5', score: 10 }]), 7.7);
+    eq('computeWeightedAverage drops unscored', computeWeightedAverage([{ level: 'Level 4', score: 10 }, { level: 'Level 1', score: 0 }]), 9);
+    eq('computeWeightedAverage empty -> null', computeWeightedAverage([]), null);
+    eq('Favorites.key one separator', Favorites.key('AB', 'CD').length, 5);
+    (() => {
+      const probe = Favorites.key('__selftest_cat', '__selftest_q');
+      const had = Favorites.set.has(probe);
+      Favorites.set.add(probe);
+      eq('Favorites.has after add', Favorites.has('__selftest_cat', '__selftest_q'), true);
+      if (!had) Favorites.set.delete(probe);
+    })();
+    eq('unionAxesMulti merges three',
+       unionAxesMulti([{ averages: { A: 1 } }, { averages: { B: 2 } }, { averages: { A: 3, C: 4 } }]), ['A', 'B', 'C']);
+    (() => {
+      const cmp = [
+        { id: 's1', engineerName: 'Ada', responses: { Backend: [{ question: 'Q1', score: 8 }] } },
+        { id: 's2', engineerName: 'Bo',  responses: { Backend: [{ question: 'Q1', score: 6 }, { question: 'Q2', score: 9 }] } },
+      ];
+      const m = compareMatrix(cmp);
+      eq('compareMatrix one category', m.length, 1);
+      eq('compareMatrix two questions', m[0].questions.length, 2);
+      eq('compareMatrix Q1 scores aligned', m[0].questions.find(q => q.question === 'Q1').scores, { s1: 8, s2: 6 });
+    })();
+    console.log(`%cSelf-tests: ${pass} passed, ${fail} failed.`,
+      `color:${fail ? '#dc2626' : '#16a34a'};font-weight:bold`);
+    showToast(`Self-tests: ${pass} passed, ${fail} failed.`, fail ? 'error' : 'success');
+  }
+
+  /* ------------------------------------------------------------------ 11. Init */
+
+  (async function init() {
+    wireAll();
+    Favorites.loadLocal();             // instant offline favorites; a connected file overrides on restore
+    await Storage.init();              // decide mode; attempt silent restore of cached handles
+    // On-device fallback (no connected file — e.g. iPad/Safari): restore the last bank + sessions.
+    if (!state.bank) { const b = LS.get(LS_BANK); if (b && b.categories) state.bank = b; }
+    if (!state.sessions.length) { const ss = LS.get(LS_SESSIONS); if (Array.isArray(ss)) state.sessions = ss; }
+    render();
+    if (new URLSearchParams(location.search).get('selftest') === '1') runSelfTests();
+  })();
+  </script>
+</body>
+</html>
