@@ -65,16 +65,66 @@
 
   /* ------------------------------------------------------------------ 1. Constants */
 
-  // A category whose name contains one of these (case-insensitive) is treated as a
-  // "soft skill" axis for the Senior role-target overlay. Edit freely.
-  const SOFT_SKILL_KEYWORDS = ['soft'];
+  // Role-expectation overlay = a per-position, per-category target, scaled by seniority.
+  //
+  //   target = clamp( TIER_VALUE[ profile[category] ?? DEFAULT_TIER ] + seniorityOffset, 1, 10 )
+  //
+  // TIER_VALUE numbers are the expectation at the *Senior* reference level; seniority shifts
+  // them. Any category a position doesn't list falls to DEFAULT_TIER (the awareness floor), so
+  // every overlay is a closed polygon — nobody is expected to know *nothing* about an axis.
+  const TIER_VALUE = { core: 9, strong: 7, working: 5, awareness: 4 };
+  const DEFAULT_TIER = 'awareness';      // floor applied to any axis a profile omits;
+                                         // with the seniority offset it scales 2 → 3 → 4 (Jr → Mid → Sr)
+  const TARGET_MIN = 1, TARGET_MAX = 10; // overlay clamp after the seniority offset
 
-  // Role expectation baselines, split into technical vs soft-skill axes.
-  const ROLE_TARGETS = {
-    junior:   { technical: 3, soft: 3 },
-    mid:      { technical: 5, soft: 5 },
-    senior:   { technical: 8, soft: 6 },
-    techlead: { technical: 8, soft: 8 },
+  // Seniority dropdown. `offset` shifts every tier value (Senior is the reference, offset 0).
+  const SENIORITY = [
+    { value: 'Junior', label: 'Junior', offset: -2 },
+    { value: 'Mid',    label: 'Mid',    offset: -1 },
+    { value: 'Senior', label: 'Senior', offset:  0 },
+  ];
+
+  // Per-position importance tiers by category. Keys must match the bank's category names.
+  // Omitted categories default to DEFAULT_TIER (awareness). Edit freely to retune.
+  const POSITION_PROFILES = {
+    'Frontend Developer': {
+      'Frontend Development': 'core', 'Cyber Security & Quality': 'strong', 'Fundamentals & Git': 'strong',
+      'Backend Development': 'working', 'Database & Storage': 'working', 'System Design & Architecture': 'working',
+    },
+    'Fullstack Developer': {
+      'Backend Development': 'strong', 'Database & Storage': 'strong', 'System Design & Architecture': 'strong',
+      'Fundamentals & Git': 'strong', 'Frontend Development': 'strong', 'DevOps & Infrastructure': 'working',
+      'Cyber Security & Quality': 'working', 'Mobile Development': 'working',
+    },
+    'Backend Developer': {
+      'Backend Development': 'core', 'Database & Storage': 'strong', 'System Design & Architecture': 'strong',
+      'Fundamentals & Git': 'strong', 'Cyber Security & Quality': 'strong', 'Frontend Development': 'working',
+      'DevOps & Infrastructure': 'working',
+    },
+    'DevOps Engineer': {
+      'DevOps & Infrastructure': 'core', 'Cyber Security & Quality': 'strong', 'System Design & Architecture': 'strong',
+      'Fundamentals & Git': 'strong', 'Backend Development': 'working', 'Database & Storage': 'working',
+    },
+    'Mobile Developer': {
+      'Mobile Development': 'core', 'Frontend Development': 'strong', 'Fundamentals & Git': 'strong',
+      'Cyber Security & Quality': 'strong', 'Backend Development': 'working', 'Database & Storage': 'working',
+      'System Design & Architecture': 'working',
+    },
+    'Tech Lead': {
+      'System Design & Architecture': 'core', 'Fundamentals & Git': 'core', 'Backend Development': 'strong',
+      'Database & Storage': 'strong', 'Frontend Development': 'strong', 'DevOps & Infrastructure': 'strong',
+      'Cyber Security & Quality': 'strong', 'AI & Machine Learning': 'working', 'Mobile Development': 'working',
+    },
+    'QA / Test Engineer': {
+      'Cyber Security & Quality': 'core', 'Fundamentals & Git': 'strong', 'Backend Development': 'working',
+      'Database & Storage': 'working', 'System Design & Architecture': 'working', 'Frontend Development': 'working',
+      'DevOps & Infrastructure': 'working', 'Mobile Development': 'working',
+    },
+    'Data / ML Engineer': {
+      'AI & Machine Learning': 'core', 'Database & Storage': 'strong', 'System Design & Architecture': 'strong',
+      'Fundamentals & Git': 'strong', 'Backend Development': 'working', 'DevOps & Infrastructure': 'working',
+      'Cyber Security & Quality': 'working',
+    },
   };
 
   // Difficulty weighting: a question's score counts toward its category in proportion to its level.
@@ -85,13 +135,8 @@
 
   const FAVORITES_FILENAME = 'favorites.json';
 
-  // Dropdown options for a new session. `value` is what we store; it maps cleanly via mapPosition().
-  const POSITIONS = [
-    { value: 'Junior',     label: 'Junior' },
-    { value: 'Mid-Level',  label: 'Mid-Level' },
-    { value: 'Senior',     label: 'Senior' },
-    { value: 'Tech Lead',  label: 'Tech Lead' },
-  ];
+  // Target-position dropdown. `value` is stored on the session and keys into POSITION_PROFILES.
+  const POSITIONS = Object.keys(POSITION_PROFILES).map(value => ({ value, label: value }));
 
   const SESSIONS_FILENAME = 'sessions.json';
 
@@ -291,29 +336,28 @@
     return byCat;
   }
 
-  /** Classify a radar axis by category name. */
-  function classifyAxis(categoryName) {
-    const lower = String(categoryName).toLowerCase();
-    return SOFT_SKILL_KEYWORDS.some(k => lower.includes(k)) ? 'soft' : 'technical';
+  /** Seniority offset (Senior = reference 0); unknown/absent seniority → 0. */
+  function seniorityOffset(seniority) {
+    const s = SENIORITY.find(x => x.value === seniority);
+    return s ? s.offset : 0;
   }
 
-  /** Tolerant position mapping (handles the dropdown values and legacy free-form strings). */
-  function mapPosition(raw) {
-    const p = String(raw || '').toLowerCase();
-    if (!p) return null;
-    if (p.includes('tech lead') || p.includes('lead')) return 'techlead';
-    if (p.includes('senior')) return 'senior';
-    if (p.includes('mid')) return 'mid';
-    if (p.includes('junior')) return 'junior';
-    return null;
-  }
+  /** Clamp an overlay value to the visible target range. */
+  function clampTarget(v) { return Math.max(TARGET_MIN, Math.min(TARGET_MAX, v)); }
 
-  /** Role-target value for each axis, or null when the position can't be mapped. */
-  function resolveRoleTargets(position, categories) {
-    const role = mapPosition(position);
-    if (!role) return null;
+  /**
+   * Per-axis target for a position at a seniority, or null when the position has no profile
+   * (e.g. legacy sessions that stored a seniority word in `position`). Axes the profile omits
+   * fall to DEFAULT_TIER, so the overlay always closes.
+   */
+  function resolveRoleTargets(position, seniority, categories) {
+    const profile = POSITION_PROFILES[position];
+    if (!profile) return null;
+    const offset = seniorityOffset(seniority);
     const targets = {};
-    categories.forEach(cat => { targets[cat] = ROLE_TARGETS[role][classifyAxis(cat)]; });
+    categories.forEach(cat => {
+      targets[cat] = clampTarget(TIER_VALUE[profile[cat] || DEFAULT_TIER] + offset);
+    });
     return targets;
   }
 
@@ -717,9 +761,10 @@
       this.destroyAll();
       const axes = sessionAxes(s);
       const datasets = [this._dataset(s.engineerName || 'Candidate', axes, c => avgOf(s, c), COLOR.a)];
-      const targets = resolveRoleTargets(s.position, axes);
+      const targets = resolveRoleTargets(s.position, s.seniority, axes);
       if (targets) {
-        datasets.push(this._dataset(`Target · ${s.position}`, axes, c => targets[c], COLOR.target, true));
+        const label = s.seniority ? `Target · ${s.seniority} ${s.position}` : `Target · ${s.position}`;
+        datasets.push(this._dataset(label, axes, c => targets[c], COLOR.target, true));
       }
       this.profile = new Chart(canvas, {
         type: 'radar',
@@ -1175,7 +1220,10 @@
       </button>`;
     }).join('');
 
-    const visible = groups[activeLevel] || [];
+    // Within the active level tab, float favorited (starred) questions to the top; stable otherwise.
+    const inTab = groups[activeLevel] || [];
+    const isFav = i => { const r = responses[i]; return !r.custom && Favorites.has(activeCat, r.question); };
+    const visible = [...inTab.filter(isFav), ...inTab.filter(i => !isFav(i))];
     const cards = visible.map(i => questionCard(activeIdx, i, responses[i])).join('') ||
       '<p class="text-sm text-slate-400">No reference questions here — add a custom question below.</p>';
     const n = scoredResponses(responses).length;
@@ -1281,10 +1329,11 @@
     const axes = sessionAxes(s);
     const breakdown = axes.map(cat => categoryBreakdownCard(s, cat)).join('');
 
-    const role = mapPosition(s.position);
-    const targetNote = role
-      ? `Dashed overlay = expectations for <strong>${esc(s.position)}</strong>.`
-      : `No role overlay (unrecognised position "${esc(s.position)}").`;
+    const hasProfile = !!POSITION_PROFILES[s.position];
+    const roleLabel = s.seniority ? `${esc(s.seniority)} ${esc(s.position)}` : esc(s.position);
+    const targetNote = hasProfile
+      ? `Dashed overlay = expectations for a <strong>${roleLabel}</strong>.`
+      : `No role overlay (no profile for "${esc(s.position)}").`;
 
     return `
       <div id="report">
@@ -1292,7 +1341,7 @@
           <div>
             <button data-action="back-to-dashboard" class="text-sm text-slate-500 hover:text-slate-800 mb-1 no-print">← Back to dashboard</button>
             <h2 class="text-2xl font-bold text-slate-900">${esc(s.engineerName)}</h2>
-            <p class="text-sm text-slate-500">${esc(s.position)} · Assessed ${esc(s.date)}</p>
+            <p class="text-sm text-slate-500">${esc(s.position)}${s.seniority ? ' · ' + esc(s.seniority) : ''} · Assessed ${esc(s.date)}</p>
           </div>
           <div class="flex items-center gap-2">
             ${btn('print-report', 'Print / Save PDF', 'secondary').replace('class="', 'class="no-print ')}
@@ -1405,6 +1454,7 @@
     const root = $('#modal-root');
     if (state.ui.modal !== 'new-session') { root.innerHTML = ''; return; }
     const opts = POSITIONS.map(p => `<option value="${esc(p.value)}">${esc(p.label)}</option>`).join('');
+    const senOpts = SENIORITY.map(s => `<option value="${esc(s.value)}"${s.value === 'Senior' ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
     root.innerHTML = `
       <div class="fixed inset-0 z-40 bg-slate-900/40 flex items-center justify-center p-4 no-print" data-action="close-modal" data-overlay>
         <div class="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
@@ -1412,8 +1462,16 @@
           <label class="block text-sm font-semibold text-slate-700 mb-1">Full Name</label>
           <input id="ns-name" type="text" placeholder="e.g. Jane Doe"
                  class="w-full mb-4 px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm" />
-          <label class="block text-sm font-semibold text-slate-700 mb-1">Target Position / Seniority</label>
-          <select id="ns-position" class="w-full mb-6 px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm">${opts}</select>
+          <div class="grid grid-cols-2 gap-3 mb-6">
+            <div>
+              <label class="block text-sm font-semibold text-slate-700 mb-1">Target Position</label>
+              <select id="ns-position" class="w-full px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm">${opts}</select>
+            </div>
+            <div>
+              <label class="block text-sm font-semibold text-slate-700 mb-1">Seniority</label>
+              <select id="ns-seniority" class="w-full px-3 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none text-sm">${senOpts}</select>
+            </div>
+          </div>
           <div class="flex justify-end gap-3">
             ${btn('close-modal', 'Cancel', 'ghost')}
             ${btn('create-session', 'Start Assessment', 'primary')}
@@ -1425,7 +1483,7 @@
 
   /* ------------------------------------------------------------------ 8. Actions */
 
-  function startSession(name, position) {
+  function startSession(name, position, seniority) {
     // Seed one response object per bank question. Guidance fields ride along for display only;
     // they are stripped before persisting (see finishAssessment).
     const responses = {};
@@ -1436,7 +1494,7 @@
       }));
     });
     state.active = {
-      id: uuid(), date: todayISO(), engineerName: name, position,
+      id: uuid(), date: todayISO(), engineerName: name, position, seniority,
       activeCategory: bankCats()[0], activeLevel: null, responses, showValidation: false,
     };
     state.ui.modal = null;
@@ -1461,7 +1519,7 @@
       scores[cat] = sr.map(r => r.score);
     });
     const session = {
-      id: a.id, date: a.date, engineerName: a.engineerName, position: a.position,
+      id: a.id, date: a.date, engineerName: a.engineerName, position: a.position, seniority: a.seniority,
       scores, averages: computeWeightedAverages(responses), responses,
     };
     state.sessions.push(session);
@@ -1500,8 +1558,9 @@
     'create-session': () => {
       const name = ($('#ns-name').value || '').trim();
       const position = $('#ns-position').value;
+      const seniority = $('#ns-seniority').value;
       if (!name) { showToast('Please enter the engineer’s name.', 'warn'); $('#ns-name').focus(); return; }
-      startSession(name, position);
+      startSession(name, position, seniority);
     },
 
     'switch-category': (ds) => {
@@ -1645,19 +1704,18 @@
     eq('computeAverage drops invalid', computeAverage([5, 0, 11, 7, null]), 6);
     eq('computeAverage empty', computeAverage([]), null);
     eq('validNumbers filters', validNumbers([1, 10, 0, 11, 5.5, 5]), [1, 10, 5]);
-    eq('classifyAxis soft', classifyAxis('Delivery & Soft Skills'), 'soft');
-    eq('classifyAxis technical', classifyAxis('Backend Development'), 'technical');
-    eq('mapPosition senior', mapPosition('Senior Engineer'), 'senior');
-    eq('mapPosition techlead', mapPosition('Tech Lead'), 'techlead');
-    eq('mapPosition mid', mapPosition('Mid-Level'), 'mid');
-    eq('mapPosition unknown', mapPosition('Consultant'), null);
-    eq('resolveRoleTargets senior split',
-       resolveRoleTargets('Senior', ['Backend Development', 'Delivery & Soft Skills']),
-       { 'Backend Development': 8, 'Delivery & Soft Skills': 6 });
-    eq('resolveRoleTargets junior flat',
-       resolveRoleTargets('Junior', ['Backend Development', 'Delivery & Soft Skills']),
-       { 'Backend Development': 3, 'Delivery & Soft Skills': 3 });
-    eq('resolveRoleTargets unmapped', resolveRoleTargets('Consultant', ['X']), null);
+    eq('seniorityOffset junior', seniorityOffset('Junior'), -2);
+    eq('seniorityOffset senior', seniorityOffset('Senior'), 0);
+    eq('seniorityOffset unknown', seniorityOffset('Principal'), 0);
+    eq('resolveRoleTargets senior core + floor',
+       resolveRoleTargets('Frontend Developer', 'Senior', ['Frontend Development', 'DevOps & Infrastructure']),
+       { 'Frontend Development': 9, 'DevOps & Infrastructure': 4 });   // core 9, omitted axis → awareness 4
+    eq('resolveRoleTargets junior offset (awareness scales)',
+       resolveRoleTargets('Frontend Developer', 'Junior', ['Frontend Development', 'DevOps & Infrastructure']),
+       { 'Frontend Development': 7, 'DevOps & Infrastructure': 2 });   // 9-2=7, awareness 4-2=2
+    eq('resolveRoleTargets mobile core', resolveRoleTargets('Mobile Developer', 'Senior', ['Mobile Development']),
+       { 'Mobile Development': 9 });
+    eq('resolveRoleTargets unknown position', resolveRoleTargets('Consultant', 'Senior', ['X']), null);
     eq('scoredResponses filters',
        scoredResponses([{ score: 8 }, { score: 0 }, { score: 11 }, { notes: 'x' }, { score: 5 }]).length, 2);
     eq('responsesToScores derives',
